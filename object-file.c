@@ -1546,6 +1546,11 @@ static int do_oid_object_info_extended(struct repository *r,
 
 	if (flags & OBJECT_INFO_LOOKUP_REPLACE)
 		real = lookup_replace_object(r, oid);
+	if (oi && oi->real_oidp) {
+		if (!(flags & OBJECT_INFO_LOOKUP_REPLACE))
+			BUG("specifying real_oidp does not make sense without OBJECT_INFO_LOOKUP_REPLACE");
+		*oi->real_oidp = real;
+	}
 
 	if (is_null_oid(real))
 		return -1;
@@ -1621,7 +1626,7 @@ static int do_oid_object_info_extended(struct repository *r,
 	rtype = packed_object_info(r, e.p, e.offset, oi);
 	if (rtype < 0) {
 		mark_bad_packed_object(e.p, real);
-		return do_oid_object_info_extended(r, real, oi, 0);
+		return do_oid_object_info_extended(r, oid, oi, flags);
 	} else if (oi->whence == OI_PACKED) {
 		oi->u.packed.offset = e.offset;
 		oi->u.packed.pack = e.p;
@@ -1659,17 +1664,27 @@ int oid_object_info(struct repository *r,
 	return type;
 }
 
+/*
+ * If real_oid is not NULL, check if oid has a replace object and store the
+ * object that we end up using there.
+ */
 static void *read_object(struct repository *r,
 			 const struct object_id *oid, enum object_type *type,
-			 unsigned long *size)
+			 unsigned long *size, const struct object_id **real_oid)
 {
 	struct object_info oi = OBJECT_INFO_INIT;
 	void *content;
+	unsigned int flags = 0;
 	oi.typep = type;
 	oi.sizep = size;
 	oi.contentp = &content;
 
-	if (oid_object_info_extended(r, oid, &oi, 0) < 0)
+	if (real_oid) {
+		flags |= OBJECT_INFO_LOOKUP_REPLACE;
+		oi.real_oidp = real_oid;
+	}
+
+	if (oid_object_info_extended(r, oid, &oi, flags) < 0)
 		return NULL;
 	return content;
 }
@@ -1705,36 +1720,42 @@ void *read_object_file_extended(struct repository *r,
 				int lookup_replace)
 {
 	void *data;
+	const struct object_id *real_oid;
+
+	errno = 0;
+	data = read_object(r, oid, type, size, &real_oid);
+	if (data)
+		return data;
+	die_if_corrupt(r, oid, real_oid);
+
+	return NULL;
+}
+
+void die_if_corrupt(struct repository *r,
+		    const struct object_id *oid,
+		    const struct object_id *real_oid)
+{
 	const struct packed_git *p;
 	const char *path;
 	struct stat st;
-	const struct object_id *repl = lookup_replace ?
-		lookup_replace_object(r, oid) : oid;
-
-	errno = 0;
-	data = read_object(r, repl, type, size);
-	if (data)
-		return data;
 
 	obj_read_lock();
 	if (errno && errno != ENOENT)
 		die_errno(_("failed to read object %s"), oid_to_hex(oid));
 
 	/* die if we replaced an object with one that does not exist */
-	if (repl != oid)
+	if (!oideq(real_oid, oid))
 		die(_("replacement %s not found for %s"),
-		    oid_to_hex(repl), oid_to_hex(oid));
+		    oid_to_hex(real_oid), oid_to_hex(oid));
 
-	if (!stat_loose_object(r, repl, &st, &path))
+	if (!stat_loose_object(r, real_oid, &st, &path))
 		die(_("loose object %s (stored in %s) is corrupt"),
-		    oid_to_hex(repl), path);
+		    oid_to_hex(real_oid), path);
 
-	if ((p = has_packed_and_bad(r, repl)))
+	if ((p = has_packed_and_bad(r, real_oid)))
 		die(_("packed object %s (stored in %s) is corrupt"),
-		    oid_to_hex(repl), p->pack_name);
+		    oid_to_hex(real_oid), p->pack_name);
 	obj_read_unlock();
-
-	return NULL;
 }
 
 void *read_object_with_reference(struct repository *r,
@@ -2276,7 +2297,7 @@ int force_object_loose(const struct object_id *oid, time_t mtime)
 
 	if (has_loose_object(oid))
 		return 0;
-	buf = read_object(the_repository, oid, &type, &len);
+	buf = read_object(the_repository, oid, &type, &len, NULL);
 	if (!buf)
 		return error(_("cannot read object for %s"), oid_to_hex(oid));
 	hdrlen = format_object_header(hdr, sizeof(hdr), type, len);
